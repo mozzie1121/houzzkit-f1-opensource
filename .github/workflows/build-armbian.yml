@@ -49,7 +49,7 @@ jobs:
 
           # 只编译 Image 和目标板 dtb
           make -j$(nproc) Image
-          make rk3568-jl-rm01.dtb
+          make rockchip/rk3568-jl-rm01.dtb
           echo "=== Image ==="
           ls -la arch/arm64/boot/Image
           echo "=== DTBs ==="
