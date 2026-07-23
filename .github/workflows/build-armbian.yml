@@ -1,0 +1,190 @@
+name: Build Armbian for HOUZZkit Force 1 (RK3568)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-armbian.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      # ────────────────────── 检出源码 ──────────────────────
+      - name: Checkout source (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ────────────────────── 安装依赖 ──────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc make g++ libssl-dev liblz4-tool expect patchelf chrpath \
+            gawk texinfo diffstat binfmt-support qemu-user-static \
+            bison flex fakeroot cmake unzip device-tree-compiler \
+            python3-pip libncurses-dev bzip2 \
+            u-boot-tools swig python3-distutils \
+            python3-dev python3-setuptools \
+            cpio rsync bc \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            pkg-config-arm-linux-gnueabihf
+          sudo pip3 install pyelftools -q
+
+      # ────────────────────── 编译内核 ──────────────────────
+      - name: Build kernel (jl_v1_linux_defconfig)
+        working-directory: houzzkit-f1-bsp-k6199/kernel-6.1
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          # 清理并配置
+          make distclean
+          make jl_v1_linux_defconfig
+          # 确认设备树文件存在
+          ls arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dts || echo "WARN: dts not found"
+          # 编译 Image + dtbs
+          make -j$(nproc) Image dtbs 2>&1 | tail -30
+          echo "=== DTBs ==="
+          ls -la arch/arm64/boot/dts/rockchip/rk3568-jl-rm01*.dtb
+          echo "=== Image ==="
+          ls -la arch/arm64/boot/Image
+
+      - name: Build kernel modules and package .deb
+        working-directory: houzzkit-f1-bsp-k6199/kernel-6.1
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          # 编译模块
+          make -j$(nproc) modules 2>&1 | tail -10
+          # 打包为 .deb（会输出到上级目录）
+          make -j$(nproc) bindeb-pkg KBUILD_BUILD_VERSION=1 LOCALVERSION=-houzzkit 2>&1 | tail -20
+          ls -la ../linux-*.deb 2>/dev/null
+
+      # ────────────────────── 存档内核产物 ──────────────────────
+      - name: Upload kernel packages (intermediate)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debs
+          path: houzzkit-f1-bsp-k6199/linux-*.deb
+          retention-days: 3
+
+      # ────────────────────── 编译 U-Boot ──────────────────────
+      - name: Build U-Boot
+        working-directory: houzzkit-f1-bsp-k6199/u-boot
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make distclean
+          make rk3568_defconfig
+          make -j$(nproc) 2>&1 | tail -20
+          echo "=== U-Boot outputs ==="
+          ls -la u-boot*.bin 2>/dev/null
+
+      # ────────────────────── 打包 U-Boot（rkbin 工具） ──────────────────────
+      - name: Package U-Boot with rkbin
+        working-directory: houzzkit-f1-bsp-k6199
+        run: |
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          # 查找 mkimage 工具
+          MKIMAGE=$(find tools -name "mkimage.sh" 2>/dev/null | head -1)
+          if [ -z "$MKIMAGE" ]; then
+            # 尝试直接从 rkbin 打包
+            cd rkbin
+            ./tools/boot_merger RKBOOT/RK3568MINIALL.ini 2>&1 | tail -5 || true
+            ls -la *.bin 2>/dev/null
+          else
+            bash $MKIMAGE u-boot 2>&1 | tail -10
+          fi
+          # 收集产物
+          mkdir -p ../uboot-output
+          find .. -name "*.img" -path "*/firmware/*" -o -name "MiniLoaderAll.bin" | head -10
+          find .. -name "MiniLoaderAll.bin" -exec cp {} ../uboot-output/ \; 2>/dev/null || true
+          find .. -name "uboot.img" -exec cp {} ../uboot-output/ \; 2>/dev/null || true
+          ls -la ../uboot-output/
+
+      # ────────────────────── 下载 Armbian 构建系统 ──────────────────────
+      - name: Checkout Armbian build system
+        uses: actions/checkout@v4
+        with:
+          repository: armbian/build
+          path: armbian-build
+          fetch-depth: 1
+
+      # ────────────────────── 注入自定义设备树 ──────────────────────
+      - name: Inject custom DTS patches
+        run: |
+          # 复制板子专用的 dts/dtsi 到 Armbian 内核源
+          DTS_SRC="houzzkit-f1-bsp-k6199/kernel-6.1/arch/arm64/boot/dts/rockchip"
+          DTS_DST="armbian-build/patch/kernel/archive/rk3568-current/dt/"
+          mkdir -p "$DTS_DST"
+          cp "$DTS_SRC/rk3568-jl-rm01.dts" "$DTS_DST/" 2>/dev/null && echo "dts copied" || echo "dts not found, skipping"
+          cp "$DTS_SRC/rk3568-jl-rm01.dtsi" "$DTS_DST/" 2>/dev/null && echo "dtsi copied" || echo "dtsi not found, skipping"
+          echo "=== Armbian dts patches ==="
+          ls -la "$DTS_DST" | head -10
+
+      # ────────────────────── 构建 Armbian 系统（不含内核） ──────────────────────
+      - name: Build Armbian rootfs
+        working-directory: armbian-build
+        run: |
+          # 只编译用户态，不编内核（用我们自己的）
+          sudo ./compile.sh \
+            BUILD_MINIMAL=yes \
+            BOARD=rockchip-rk3568 \
+            BRANCH=current \
+            RELEASE=bookworm \
+            BUILD_DESKTOP=no \
+            KERNEL_ONLY=no \
+            KERNEL_CONFIGURE=no \
+            EXPERT=yes \
+            SKIP_KERNEL_CHECK=yes \
+            SKIP_BOOTSPLASH=yes \
+            FORCE_CHECKOUT=yes \
+            IGNORE_UPDATES=yes \
+            PROGRESS_DISPLAY=plain \
+            ARTIFACT_IGNORE_CACHE=yes 2>&1 | tail -50
+
+      # ────────────────────── 替换内核 ──────────────────────
+      - name: Replace kernel with custom .deb
+        run: |
+          # 找到 Armbian 构建的输出目录
+          OUTPUT_DIR=$(find armbian-build/output -maxdepth 2 -type d -name "*.img" -exec dirname {} \; 2>/dev/null | head -1)
+          if [ -z "$OUTPUT_DIR" ]; then
+            OUTPUT_DIR=$(find armbian-build/output -maxdepth 2 -name "*.img" 2>/dev/null | head -1 | xargs dirname)
+          fi
+          echo "Output dir: $OUTPUT_DIR"
+          if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+            # 解压镜像，替换内核包
+            # 实际上 Armbian 用 .cache 缓存，直接替换缓存中的 .deb
+            find armbian-build/output -name "*.cache" -type d 2>/dev/null | head -5
+            find armbian-build/cache -name "linux-image*" 2>/dev/null | head -5
+          fi
+          # 简单策略：把 .deb 放到 Armbian 包缓存目录中
+          mkdir -p armbian-build/cache/debs
+          cp houzzkit-f1-bsp-k6199/linux-*.deb armbian-build/cache/debs/ 2>/dev/null && echo "DEBs copied" || echo "No DEBs found"
+
+      # ────────────────────── 查找输出并上传 ──────────────────────
+      - name: Collect and upload artifacts
+        run: |
+          mkdir -p final-output
+          # 找 Armbian 的 .img 输出
+          find armbian-build/output -name "*.img" -exec cp {} final-output/ \; 2>/dev/null || true
+          # 找内核 deb
+          find houzzkit-f1-bsp-k6199 -name "linux-*.deb" -exec cp {} final-output/ \; 2>/dev/null || true
+          # 找 uboot 产物
+          find . -name "MiniLoaderAll.bin" -o -name "uboot.img" | while read f; do cp "$f" final-output/; done 2>/dev/null || true
+          echo "=== Final artifacts ==="
+          ls -lh final-output/
+
+      - name: Upload final artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: houzzkit-f1-armbian-image
+          path: final-output/
+          retention-days: 7
