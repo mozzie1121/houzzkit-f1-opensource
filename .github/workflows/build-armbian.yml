@@ -34,8 +34,7 @@ jobs:
             u-boot-tools swig python3-distutils \
             python3-dev python3-setuptools \
             cpio rsync bc \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            pkg-config-arm-linux-gnueabihf
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           sudo pip3 install pyelftools -q
 
       # ────────────────────── 编译内核 ──────────────────────
