@@ -3,8 +3,6 @@ name: Build Armbian for HOUZZkit Force 1 (RK3568)
 on:
   push:
     branches: [ main ]
-    paths:
-      - '.github/workflows/build-armbian.yml'
   workflow_dispatch:
 
 concurrency:
