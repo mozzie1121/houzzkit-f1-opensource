@@ -48,8 +48,9 @@ jobs:
           make jl_v1_linux_defconfig
           # 确认设备树文件存在
           ls arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dts || echo "WARN: dts not found"
-          # 编译 Image + dtbs
-          make -j$(nproc) Image dtbs 2>&1 | tail -30
+          # 只编译目标板子的 dtb，避免全量编译缺少的 dts 导致失败
+          make -j$(nproc) Image
+          make rk3568-jl-rm01.dtb 2>&1 | tail -10
           echo "=== DTBs ==="
           ls -la arch/arm64/boot/dts/rockchip/rk3568-jl-rm01*.dtb
           echo "=== Image ==="
