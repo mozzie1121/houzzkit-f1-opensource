@@ -47,7 +47,7 @@ jobs:
           make distclean
           make jl_v1_linux_defconfig
 
-          # 只编译 Image 和目标板 dtb
+          # 编译 Image 和目标板 dtb
           make -j$(nproc) Image
           make rockchip/rk3568-jl-rm01.dtb
           echo "=== Image ==="
@@ -55,17 +55,42 @@ jobs:
           echo "=== DTBs ==="
           ls -la arch/arm64/boot/dts/rockchip/rk3568-jl-rm01*.dtb
 
-          # 编译模块并打包 .deb
-          make -j$(nproc) modules 2>&1 | tail -5
-          make -j$(nproc) bindeb-pkg KBUILD_BUILD_VERSION=1 LOCALVERSION=-houzzkit 2>&1 | tail -10
-          echo "=== DEBs ==="
-          ls -la ../linux-*.deb
+          # 编译模块
+          make -j$(nproc) modules
+
+          # 手工打包内核 .deb（bindeb-pkg 在旧 BSP 上容易出问题）
+          mkdir -p ../kernel-deb/DEBIAN
+          mkdir -p ../kernel-deb/boot ../kernel-deb/lib/modules
+          INSTALL_MOD_PATH=../kernel-deb make modules_install
+          cp arch/arm64/boot/Image ../kernel-deb/boot/vmlinuz-6.1.0-houzzkit
+          cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../kernel-deb/boot/
+
+          KERNEL_VER=$(make kernelversion 2>/dev/null | tail -1)
+          cat > ../kernel-deb/DEBIAN/control << EOF
+Package: linux-image-houzzkit
+Version: ${KERNEL_VER}-houzzkit-1
+Architecture: arm64
+Maintainer: Hermes Agent
+Description: Custom kernel for HOUZZkit Force 1 (RK3568)
+EOF
+          cat > ../kernel-deb/DEBIAN/postinst << 'SCRIPT'
+#!/bin/sh
+set -e
+if [ -d /boot ]; then
+  mkdir -p /boot/dtb/rockchip
+  cp /boot/rk3568-jl-rm01.dtb /boot/dtb/rockchip/ 2>/dev/null || true
+fi
+SCRIPT
+          chmod 755 ../kernel-deb/DEBIAN/postinst
+          dpkg-deb --build ../kernel-deb ../linux-image-houzzkit_${KERNEL_VER}-houzzkit-1_arm64.deb
+          echo "=== DEB ==="
+          ls -la ../linux-image-*.deb
 
       - name: Upload kernel packages (intermediate)
         uses: actions/upload-artifact@v4
         with:
           name: kernel-debs
-          path: houzzkit-f1-bsp-k6199/linux-*.deb
+          path: houzzkit-f1-bsp-k6199/linux-image-*.deb
           retention-days: 3
 
       # ────────────────────── 编译 U-Boot ──────────────────────
