@@ -96,7 +96,7 @@ jobs:
               systemd systemd-sysv udev openssh-server sudo curl wget \
               u-boot-tools network-manager ca-certificates locales kmod \
               initramfs-tools firmware-linux \
-              ethtool wireless-regdb
+              ethtool wireless-regdb gpiod
             echo 'root:1234' | chpasswd
             echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
             locale-gen
@@ -119,6 +119,22 @@ jobs:
             sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" staging/rootfs/etc/shadow;
             echo "Direct shadow write done";
           }
+
+          # Apply hardware-specific config from original firmware
+          echo "=== Applying hardware configuration ==="
+          echo "houzzkit" | sudo tee staging/rootfs/etc/hostname > /dev/null
+          printf '%s\n' \
+            '127.0.0.1\tlocalhost' \
+            '::1\t\tlocalhost ip6-localhost ip6-loopback' \
+            'ff02::1\t\tip6-allnodes' \
+            'ff02::2\t\tip6-allrouters' \
+            '' \
+            '127.0.1.1\thouzzkit' | sudo tee staging/rootfs/etc/hosts > /dev/null
+          sudo mkdir -p staging/rootfs/etc/modules-load.d
+          echo "ledtrig-netdev" | sudo tee staging/rootfs/etc/modules-load.d/ledtrig-netdev.conf > /dev/null
+          echo "r8169" | sudo tee staging/rootfs/etc/modules-load.d/r8169.conf > /dev/null
+          # Enable SSH root login with password
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' staging/rootfs/etc/ssh/sshd_config 2>/dev/null || true
 
           echo "=== Rootfs size ==="
           sudo du -sh staging/rootfs
