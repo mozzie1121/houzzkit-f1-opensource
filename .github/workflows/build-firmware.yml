@@ -72,26 +72,35 @@ jobs:
           done
           ls -la ../../uboot-staging/
 
-      - name: Build rootfs with debootstrap
+      - name: Build rootfs with debootstrap (Ubuntu Noble + Armbian)
         run: |
           sudo mkdir -p staging/rootfs
-          echo "=== Creating minimal Debian Bookworm rootfs ==="
-          sudo debootstrap --arch=arm64 --foreign bookworm staging/rootfs 2>&1
+          echo "=== Creating minimal Ubuntu Noble (24.04) rootfs ==="
+          sudo debootstrap --arch=arm64 --foreign noble staging/rootfs 2>&1
           sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
           sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1 || true
           sudo chroot staging/rootfs /bin/bash -c '
+            # Add Armbian apt source
+            echo "deb https://apt.armbian.com noble main" > /etc/apt/sources.list.d/armbian.list
             apt-get update
             apt-get install -y --no-install-recommends \
               systemd systemd-sysv udev openssh-server sudo curl wget \
-              u-boot-tools network-manager ca-certificates locales kmod 2>/dev/null || true
-            echo "root:1234" | chpasswd
+              u-boot-tools network-manager ca-certificates locales kmod \
+              initramfs-tools \
+              armbian-config armbian-bsp-cli-rk3568 \
+              armbian-firmware 2>/dev/null || true
+            echo "root:houzzkit" | chpasswd
             echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
             locale-gen
             systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
             systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
+            # Generate initramfs
+            update-initramfs -u -k all 2>&1 || true
           ' || true
           echo "=== Rootfs size ==="
           sudo du -sh staging/rootfs
+          echo "=== Initrd files ==="
+          ls -la staging/rootfs/boot/initrd* 2>/dev/null || echo "No initrd found"
 
       - name: Assemble firmware package (RKDevTool format)
         run: |
@@ -137,6 +146,18 @@ jobs:
           \tfdt /rk-kernel.dtb
           EXTLINUX
 
+          # Install initrd from rootfs into boot.img
+          INITRD_SRC=$(ls staging/rootfs/boot/initrd.img-* 2>/dev/null | head -1)
+          if [ -n "$INITRD_SRC" ]; then
+            INITRD_DST="initrd-${KERNEL_VER}"
+            sudo cp "$INITRD_SRC" mnt-boot/${INITRD_DST}
+            echo "Initrd installed: ${INITRD_DST}"
+            # Update extlinux.conf with initrd line
+            sudo sed -i '/fdt/a\\tinitrd /'${INITRD_DST}'' mnt-boot/extlinux/extlinux.conf
+          else
+            echo "WARNING: No initrd found in rootfs, boot.img may not boot without external initrd"
+          fi
+
           sudo sync
           sudo umount mnt-boot
           sudo losetup -d "$LOOP_BOOT"
@@ -144,7 +165,7 @@ jobs:
 
           # Create rootfs.img — ext4 partition with full root filesystem
           echo "Creating rootfs.img..."
-          ROOTFS_SIZE=2800
+          ROOTFS_SIZE=3500
           sudo dd if=/dev/zero of=firmware/rootfs.img bs=1M count=$ROOTFS_SIZE status=none
           LOOP_ROOT=$(sudo losetup -fP --show firmware/rootfs.img)
           sudo mkfs.ext4 -L rootfs -F "${LOOP_ROOT}" > /dev/null 2>&1
