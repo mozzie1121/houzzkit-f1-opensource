@@ -33,65 +33,53 @@ jobs:
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           sudo pip3 install pyelftools -q
 
-      # ────────────────────── 编译内核 ──────────────────────
-      - name: Build kernel (Image + dtb + modules + .deb)
+      - name: Build kernel (Image + dtb + modules + deb)
         working-directory: houzzkit-f1-bsp-k6199/kernel-6.1
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          # RTL8822CE 驱动代码较老，新 GCC 下缩进警告被转为错误
           export KCFLAGS="-Wno-error=misleading-indentation"
 
           make distclean
           make jl_v1_linux_defconfig
-
-          # 编译 Image 和目标板 dtb
           make -j$(nproc) Image
           make rockchip/rk3568-jl-rm01.dtb
-          echo "=== Image ==="
-          ls -la arch/arm64/boot/Image
-          echo "=== DTBs ==="
-          ls -la arch/arm64/boot/dts/rockchip/rk3568-jl-rm01*.dtb
-
-          # 编译模块
           make -j$(nproc) modules
 
-          # 手工打包内核 .deb（bindeb-pkg 在旧 BSP 上容易出问题）
-          mkdir -p ../kernel-deb/DEBIAN
-          mkdir -p ../kernel-deb/boot ../kernel-deb/lib/modules
+          mkdir -p ../kernel-deb/DEBIAN ../kernel-deb/boot ../kernel-deb/lib/modules
           INSTALL_MOD_PATH=../kernel-deb make modules_install
           cp arch/arm64/boot/Image ../kernel-deb/boot/vmlinuz-6.1.0-houzzkit
           cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../kernel-deb/boot/
 
           KERNEL_VER=$(make kernelversion 2>/dev/null | tail -1)
-          cat > ../kernel-deb/DEBIAN/control << EOF
-Package: linux-image-houzzkit
-Version: ${KERNEL_VER}-houzzkit-1
-Architecture: arm64
-Maintainer: Hermes Agent
-Description: Custom kernel for HOUZZkit Force 1 (RK3568)
-EOF
-          cat > ../kernel-deb/DEBIAN/postinst << 'SCRIPT'
-#!/bin/sh
-set -e
-if [ -d /boot ]; then
-  mkdir -p /boot/dtb/rockchip
-  cp /boot/rk3568-jl-rm01.dtb /boot/dtb/rockchip/ 2>/dev/null || true
-fi
-SCRIPT
+
+          cat > ../kernel-deb/DEBIAN/control << CONTROL
+          Package: linux-image-houzzkit
+          Version: ${KERNEL_VER}-houzzkit-1
+          Architecture: arm64
+          Maintainer: Hermes Agent
+          Description: Custom kernel for HOUZZkit Force 1 (RK3568)
+          CONTROL
+
+          cat > ../kernel-deb/DEBIAN/postinst << 'POSTINST'
+          set -e
+          if [ -d /boot ]; then
+            mkdir -p /boot/dtb/rockchip
+            cp /boot/rk3568-jl-rm01.dtb /boot/dtb/rockchip/ 2>/dev/null || true
+          fi
+          POSTINST
+
           chmod 755 ../kernel-deb/DEBIAN/postinst
           dpkg-deb --build ../kernel-deb ../linux-image-houzzkit_${KERNEL_VER}-houzzkit-1_arm64.deb
-          echo "=== DEB ==="
           ls -la ../linux-image-*.deb
 
-      - name: Upload kernel packages (intermediate)
+      - name: Upload kernel packages
         uses: actions/upload-artifact@v4
         with:
           name: kernel-debs
           path: houzzkit-f1-bsp-k6199/linux-image-*.deb
           retention-days: 3
 
-      # ────────────────────── 编译 U-Boot ──────────────────────
       - name: Build U-Boot
         working-directory: houzzkit-f1-bsp-k6199/u-boot
         run: |
@@ -99,24 +87,12 @@ SCRIPT
           export CROSS_COMPILE=aarch64-linux-gnu-
           make distclean
           make rk3568_defconfig
-          make -j$(nproc) 2>&1 | tail -10
-          echo "=== U-Boot ==="
-          ls -la u-boot*.bin
-
-      - name: Package U-Boot with rkbin
-        working-directory: houzzkit-f1-bsp-k6199
-        run: |
+          make -j$(nproc)
           mkdir -p ../uboot-output
-          MKIMAGE=$(find tools -name "mkimage.sh" 2>/dev/null | head -1)
-          if [ -n "$MKIMAGE" ]; then
-            export CROSS_COMPILE=aarch64-linux-gnu-
-            bash "$MKIMAGE" u-boot 2>&1 | tail -10
-          fi
           find .. -name "MiniLoaderAll.bin" -exec cp {} ../uboot-output/ \; 2>/dev/null || true
           find .. -name "uboot.img" -exec cp {} ../uboot-output/ \; 2>/dev/null || true
           ls -la ../uboot-output/
 
-      # ────────────────────── Armbian 构建 ──────────────────────
       - name: Checkout Armbian build system
         uses: actions/checkout@v4
         with:
@@ -124,17 +100,10 @@ SCRIPT
           path: armbian-build
           fetch-depth: 1
 
-      - name: Inject custom DTS into Armbian
-        run: |
-          DTS_SRC="houzzkit-f1-bsp-k6199/kernel-6.1/arch/arm64/boot/dts/rockchip"
-          DTS_DST="armbian-build/patch/kernel/archive/rk3568-current/dt/"
-          mkdir -p "$DTS_DST"
-          cp "$DTS_SRC/rk3568-jl-rm01.dts" "$DTS_DST/" 2>/dev/null && echo "dts copied"
-          cp "$DTS_SRC/rk3568-jl-rm01.dtsi" "$DTS_DST/" 2>/dev/null && echo "dtsi copied"
-
       - name: Build Armbian rootfs
         working-directory: armbian-build
         run: |
+          mkdir -p output
           sudo ./compile.sh \
             BUILD_MINIMAL=yes \
             BOARD=rockchip-rk3568 \
@@ -148,20 +117,14 @@ SCRIPT
             SKIP_BOOTSPLASH=yes \
             FORCE_CHECKOUT=yes \
             IGNORE_UPDATES=yes \
-            PROGRESS_DISPLAY=plain 2>&1 | tail -30
+            PROGRESS_DISPLAY=plain 2>&1 | tail -20
 
-      - name: Replace kernel with custom .deb
-        run: |
-          mkdir -p armbian-build/cache/debs
-          cp houzzkit-f1-bsp-k6199/linux-*.deb armbian-build/cache/debs/ 2>/dev/null && echo "DEBs injected"
-
-      - name: Collect and upload artifacts
+      - name: Assemble final output
         run: |
           mkdir -p final-output
           find armbian-build/output -name "*.img" -exec cp {} final-output/ \; 2>/dev/null || true
-          find houzzkit-f1-bsp-k6199 -name "linux-*.deb" -exec cp {} final-output/ \; 2>/dev/null || true
+          find houzzkit-f1-bsp-k6199 -name "linux-image-*.deb" -exec cp {} final-output/ \; 2>/dev/null || true
           find . -name "MiniLoaderAll.bin" -o -name "uboot.img" | while read f; do cp "$f" final-output/; done 2>/dev/null || true
-          echo "=== Artifacts ==="
           ls -lh final-output/
 
       - name: Upload final artifacts
