@@ -95,7 +95,7 @@ jobs:
             apt-get install -y --no-install-recommends \
               systemd systemd-sysv udev openssh-server sudo curl wget \
               u-boot-tools network-manager ca-certificates locales kmod \
-              initramfs-tools firmware-linux \
+              initramfs-tools firmware-linux-free \
               ethtool wireless-regdb gpiod
             echo 'root:1234' | chpasswd
             echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
