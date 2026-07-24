@@ -52,7 +52,6 @@ jobs:
           INSTALL_MOD_PATH=../../kernel-staging make modules_install
           cp arch/arm64/boot/Image ../../kernel-staging/boot/
           cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../../kernel-staging/boot/
-          cp arch/arm64/boot/dts/rockchip/*.dtb ../../kernel-staging/boot/dtb/rockchip/ 2>/dev/null || true
           echo "Kernel built:"
           ls -la ../../kernel-staging/boot/
 
@@ -65,7 +64,7 @@ jobs:
           make rk3568_defconfig
           make -j$(nproc) 2>&1 || true
           if [ ! -f u-boot.itb ]; then
-            echo "No u-boot.itb (missing tee.bin), building with dummy tee.bin..."
+            echo "No u-boot.itb, building with dummy tee.bin..."
             touch tee.bin
             make -j$(nproc) u-boot.itb 2>&1 || true
             rm -f tee.bin
@@ -104,31 +103,43 @@ jobs:
           set -e
           mkdir -p final-output staging
 
-          # Create disk image
+          KERNEL_VER="6.1.99"
+          DTB="rk3568-jl-rm01.dtb"
+
+          # Create disk image (same layout as original eMMC)
+          # Original: uboot(8MB)+misc(4MB)+boot(128MB ext4)+recovery(64MB)+backup(32MB)+rootfs(~5.3GB)+userdata(~24GB)
+          # Ours:     uboot(8MB)+misc(4MB)+boot(128MB ext4)+rootfs(~2.5GB)
           DISK_SIZE=2800
           sudo dd if=/dev/zero of=staging/armbian.img bs=1M count=$DISK_SIZE status=progress
 
-          # Partition: GPT with boot (256MB fat32) + rootfs
+          # Create GPT partition table with PARTLABELs matching original
           sudo parted staging/armbian.img mktable gpt
-          sudo parted staging/armbian.img mkpart primary fat32 8MiB 264MiB
-          sudo parted staging/armbian.img mkpart primary ext4 264MiB 100%
+          sudo parted staging/armbian.img mkpart uboot fat32 8MiB 16MiB
+          sudo parted staging/armbian.img mkpart misc ext4 16MiB 20MiB
+          sudo parted staging/armbian.img mkpart boot ext4 20MiB 148MiB
+          sudo parted staging/armbian.img mkpart recovery ext4 148MiB 212MiB
+          sudo parted staging/armbian.img mkpart backup ext4 212MiB 244MiB
+          sudo parted staging/armbian.img mkpart rootfs ext4 244MiB 100%
           sudo parted staging/armbian.img set 1 boot on
 
           LOOP=$(sudo losetup -fP --show staging/armbian.img)
-          sudo mkfs.vfat -F32 -n BOOT "${LOOP}p1"
-          sudo mkfs.ext4 -L rootfs "${LOOP}p2"
+          echo "Loop device: $LOOP"
+
+          # Format partitions (only boot + rootfs need filesystems)
+          sudo mkfs.ext4 -L boot "${LOOP}p3" > /dev/null 2>&1
+          sudo mkfs.ext4 -L rootfs "${LOOP}p6" > /dev/null 2>&1
 
           mkdir -p mnt-boot mnt-root
-          sudo mount "${LOOP}p1" mnt-boot
-          sudo mount "${LOOP}p2" mnt-root
+          sudo mount "${LOOP}p3" mnt-boot
+          sudo mount "${LOOP}p6" mnt-root
 
-          # Install rootfs from staging
+          # Install rootfs
           if [ -d staging/rootfs ]; then
             echo "Installing debootstrap rootfs..."
             sudo cp -a staging/rootfs/* mnt-root/
           fi
 
-          # Create /boot and /etc directories if missing
+          # Create /boot in rootfs
           sudo mkdir -p mnt-root/boot mnt-root/etc
 
           # Install kernel modules
@@ -141,54 +152,34 @@ jobs:
             fi
           fi
 
-          # Install kernel Image + dtb to rootfs /boot
+          # Install kernel Image + dtb to boot partition (matching original naming)
+          KERNEL_IMG="Image-${KERNEL_VER}"
           if [ -f kernel-staging/boot/Image ]; then
-            sudo mkdir -p mnt-root/boot/dtb/rockchip
-            sudo cp kernel-staging/boot/Image mnt-root/boot/vmlinuz-6.1.0-houzzkit
-            sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-root/boot/
-            sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-root/boot/dtb/rockchip/
-            echo "Kernel Image + dtb installed to rootfs"
+            sudo cp kernel-staging/boot/Image mnt-boot/${KERNEL_IMG}
+            sudo cp kernel-staging/boot/${DTB} mnt-boot/
+            sudo ln -sf ${DTB} mnt-boot/rk-kernel.dtb
+            echo "Kernel + dtb installed to boot partition"
           fi
 
-          # Copy kernel and dtb to boot partition
+          # Also copy to rootfs /boot
           if [ -f kernel-staging/boot/Image ]; then
-            sudo cp kernel-staging/boot/Image mnt-boot/Image
-            sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-boot/
+            sudo mkdir -p mnt-root/boot
+            sudo cp kernel-staging/boot/Image mnt-root/boot/${KERNEL_IMG}
+            sudo cp kernel-staging/boot/${DTB} mnt-root/boot/
+            sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb 2>/dev/null || true
           fi
 
-          # Copy uboot files to boot partition
-          if [ -f uboot-output/idbloader.img ]; then
-            sudo cp uboot-output/idbloader.img mnt-boot/
-          fi
-          if [ -f uboot-output/u-boot.itb ]; then
-            sudo cp uboot-output/u-boot.itb mnt-boot/
-          fi
-
-          # Create extlinux config on boot partition
+          # Create extlinux config (matching original format exactly)
           sudo mkdir -p mnt-boot/extlinux
-          cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << 'EXTLINUX'
-          LABEL Armbian
-          LINUX /Image
-          FDT /rk3568-jl-rm01.dtb
-          APPEND root=/dev/mmcblk0p2 rw rootwait console=ttyFIQ0,1500000 console=tty0 earlycon=uart8250,mmio32,0xfe660000 net.ifnames=0 biosdevname=0
+          cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << EXTLINUX
+          label rk-kernel.dtb linux-${KERNEL_VER}
+          \tkernel /${KERNEL_IMG}
+          \tfdt /rk-kernel.dtb
           EXTLINUX
 
-          # Create armbianEnv.txt
-          cat | sudo tee mnt-boot/armbianEnv.txt > /dev/null << 'ENV'
-          verbosity=1
-          bootlogo=false
-          overlay_prefix=rockchip
-          fdtfile=rk3568-jl-rm01.dtb
-          rootdev=/dev/mmcblk0p2
-          rootfstype=ext4
-          ENV
-
-          # Copy armbianEnv.txt to rootfs /boot
-          sudo cp mnt-boot/armbianEnv.txt mnt-root/boot/ 2>/dev/null || true
-
           # Generate fstab
-          echo "/dev/mmcblk0p2  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
-          echo "/dev/mmcblk0p1  /boot  vfat  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
+          echo "PARTLABEL=rootfs  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
+          echo "PARTLABEL=boot  /boot  ext4  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
 
           sudo sync
 
@@ -196,7 +187,7 @@ jobs:
           sudo umount mnt-boot mnt-root
           sudo losetup -d "$LOOP"
 
-          # Write uboot to raw disk offsets (Rockchip boot flow)
+          # Write uboot to raw disk offsets (same as original: sector 64 and 16384)
           echo "Writing u-boot to raw image..."
           if [ -f uboot-output/idbloader.img ]; then
             sudo dd if=uboot-output/idbloader.img of=staging/armbian.img bs=512 seek=64 conv=notrunc status=progress
