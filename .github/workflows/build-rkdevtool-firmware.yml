@@ -1,0 +1,206 @@
+name: Build RKDevTool firmware for HOUZZkit Force 1 (RK3568)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            make gcc libssl-dev liblz4-tool expect patchelf chrpath \
+            gawk texinfo diffstat binfmt-support qemu-user-static \
+            bison flex fakeroot cmake unzip device-tree-compiler \
+            python3-pip libncurses-dev bzip2 \
+            u-boot-tools swig python3-distutils \
+            python3-dev python3-setuptools \
+            cpio rsync bc dosfstools mtools \
+            xz-utils pigz fdisk e2fsprogs debootstrap
+          sudo pip3 install pyelftools -q
+
+      - name: Build kernel (Image + dtb + modules)
+        working-directory: houzzkit-f1-bsp-k6199/kernel-6.1
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS="-Wno-error=misleading-indentation"
+          make distclean
+          make jl_v1_linux_defconfig
+          make -j$(nproc) Image
+          make rockchip/rk3568-jl-rm01.dtb
+          make -j$(nproc) modules
+          mkdir -p ../../kernel-staging/boot ../../kernel-staging/lib/modules
+          INSTALL_MOD_PATH=../../kernel-staging make modules_install
+          cp arch/arm64/boot/Image ../../kernel-staging/boot/
+          cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../../kernel-staging/boot/
+          echo "Kernel built:"
+
+      - name: Build rootfs with debootstrap
+        run: |
+          sudo mkdir -p staging/rootfs
+          sudo debootstrap --arch=arm64 --foreign bookworm staging/rootfs 2>&1
+          sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
+          sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1 || true
+          sudo chroot staging/rootfs /bin/bash -c '
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              systemd systemd-sysv udev openssh-server sudo curl wget \
+              u-boot-tools network-manager ca-certificates locales kmod 2>/dev/null || true
+            echo "root:1234" | chpasswd
+            echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+            locale-gen
+            systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
+          ' || true
+
+      - name: Create boot.img (ext4 with kernel + dtb + extlinux)
+        run: |
+          KERNEL_VER="6.1.99"
+          DTB="rk3568-jl-rm01.dtb"
+
+          # Create 128MB ext4 boot image
+          sudo dd if=/dev/zero of=boot.img bs=1M count=128 status=progress
+          LOOP=$(sudo losetup -fP --show boot.img)
+          sudo mkfs.ext4 -L boot "${LOOP}"
+          mkdir -p mnt-boot
+          sudo mount "${LOOP}" mnt-boot
+
+          # Install kernel
+          sudo mkdir -p mnt-boot/extlinux
+          KERNEL_IMG="Image-${KERNEL_VER}"
+          sudo cp kernel-staging/boot/Image mnt-boot/${KERNEL_IMG}
+          sudo cp kernel-staging/boot/${DTB} mnt-boot/
+          sudo ln -sf ${DTB} mnt-boot/rk-kernel.dtb
+
+          # extlinux config
+          cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << EXTLINUX
+          label rk-kernel.dtb linux-${KERNEL_VER}
+          \tkernel /${KERNEL_IMG}
+          \tfdt /rk-kernel.dtb
+          EXTLINUX
+
+          sudo sync
+          sudo umount mnt-boot
+          sudo losetup -d "${LOOP}"
+          e2fsck -f boot.img 2>/dev/null || true
+          echo "boot.img created: $(ls -lh boot.img)"
+
+      - name: Create rootfs.img (ext4 with Debian rootfs)
+        run: |
+          # Create rootfs image - 2500MB
+          sudo dd if=/dev/zero of=rootfs.img bs=1M count=2500 status=progress
+          LOOP=$(sudo losetup -fP --show rootfs.img)
+          sudo mkfs.ext4 -L rootfs "${LOOP}"
+          mkdir -p mnt-root
+          sudo mount "${LOOP}" mnt-root
+
+          # Install rootfs
+          sudo cp -a staging/rootfs/* mnt-root/
+
+          # Install kernel modules
+          if [ -d kernel-staging/lib/modules ]; then
+            MOD_VER=$(ls kernel-staging/lib/modules/ 2>/dev/null | head -1)
+            if [ -n "$MOD_VER" ]; then
+              sudo mkdir -p mnt-root/lib/modules
+              sudo cp -a kernel-staging/lib/modules/$MOD_VER mnt-root/lib/modules/
+            fi
+          fi
+
+          # Copy kernel + dtb to rootfs /boot
+          KERNEL_VER="6.1.99"
+          DTB="rk3568-jl-rm01.dtb"
+          KERNEL_IMG="Image-${KERNEL_VER}"
+          sudo mkdir -p mnt-root/boot
+          sudo cp kernel-staging/boot/Image mnt-root/boot/${KERNEL_IMG}
+          sudo cp kernel-staging/boot/${DTB} mnt-root/boot/
+          sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb 2>/dev/null || true
+
+          # fstab
+          echo "PARTLABEL=rootfs  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
+          echo "PARTLABEL=boot  /boot  ext4  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
+
+          sudo sync
+          sudo umount mnt-root
+          sudo losetup -d "${LOOP}"
+          e2fsck -f rootfs.img 2>/dev/null || true
+          echo "rootfs.img created: $(ls -lh rootfs.img)"
+
+      - name: Create parameter.txt
+        run: |
+          # Matches original eMMC layout exactly
+          # p1=uboot(8M@8M) p2=misc(4M) p3=boot(128M) p4=recovery(64M) p5=backup(32M) p6=rootfs p7=userdata
+          cat > parameter.txt << 'PARAM'
+          FIRMWARE_VER: 1.0.0
+          MACHINE_MODEL: HOUZZkit F1
+          MACHINE_ID: 007
+          MANUFACTURER: HOUZZkit
+          MAGIC: 0x5041524B
+          ATAG: 0x00200800
+          MACHINE: 0xffffffff
+          CHECK_MASK: 0x80
+          PWR_HLD: 0,0,A,0,1
+          TYPE: GPT
+          CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00002000(uboot),0x00001000@0x00004000(misc),0x00020000@0x00005000(boot),0x00010000@0x00025000(recovery),0x00008000@0x00035000(backup),0x00A00000@0x0003D000(rootfs),-@0x00A3D000(userdata:grow)
+          uuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9
+          PARAM
+          echo "parameter.txt:"
+          cat parameter.txt
+
+      - name: Create flash.bat (Windows batch script)
+        run: |
+          cat > flash.bat << 'BAT'
+          @echo off
+          echo ========================================
+          echo HOUZZkit F1 Flashing Script
+          echo ========================================
+          echo.
+          echo Make sure your device is in Loader mode
+          echo.
+          echo Steps:
+          echo 1. Open RKDevTool
+          echo 2. Load parameter.txt
+          echo 3. Load and flash images in order:
+          echo    - bootloader: uboot.img @ 0x00004000
+          echo    - boot: boot.img @ 0x00008000
+          echo    - rootfs: rootfs.img @ 0x0003D000
+          echo.
+          pause
+          BAT
+
+      - name: Create package
+        run: |
+          mkdir -p firmware-package
+          cp parameter.txt firmware-package/
+          cp boot.img firmware-package/
+          cp rootfs.img firmware-package/
+          cp flash.bat firmware-package/
+          # Note: uboot.img is NOT included - user must place their original uboot.img in this folder
+          echo "Put your uboot.img (from manufacturer) in this folder" > firmware-package/README.txt
+          echo "Then use RKDevTool or AndroidTool to flash" >> firmware-package/README.txt
+          echo "" >> firmware-package/README.txt
+          echo "Flash order:" >> firmware-package/README.txt
+          echo "1. Bootloader: uboot.img @ 0x00004000" >> firmware-package/README.txt
+          echo "2. boot: boot.img @ 0x00008000" >> firmware-package/README.txt
+          echo "3. rootfs: rootfs.img @ 0x0003D000" >> firmware-package/README.txt
+          echo "" >> firmware-package/README.txt
+          echo "Parameter file: parameter.txt (load into RKDevTool first)" >> firmware-package/README.txt
+          ls -lh firmware-package/
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: houzzkit-f1-rkdevtool-firmware
+          path: firmware-package/
+          retention-days: 7
