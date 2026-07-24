@@ -2,7 +2,7 @@ name: Build firmware (Debian Bookworm)
 
 on:
   push:
-    branches: [ debian ]
+    branches: [ main ]
   workflow_dispatch:
 
 concurrency:
@@ -97,7 +97,7 @@ jobs:
               u-boot-tools network-manager ca-certificates locales kmod \
               initramfs-tools firmware-linux \
               ethtool wireless-regdb
-            echo 'root:houzzkit' | chpasswd
+            echo 'root:1234' | chpasswd
             echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
             locale-gen
             systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
@@ -110,6 +110,15 @@ jobs:
               update-initramfs -c -k all
             fi
           "
+
+          # Post-chroot password guarantee
+          echo "=== Ensuring root password ==="
+          sudo chroot staging/rootfs /bin/bash -c 'echo "root:1234" | chpasswd' 2>&1 && echo "chpasswd OK" || {
+            echo "chpasswd failed, writing hash directly...";
+            HASH=$(openssl passwd -6 1234 2>/dev/null || python3 -c "import crypt; print(crypt.crypt('1234', crypt.mksalt(crypt.METHOD_SHA256)))");
+            sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" staging/rootfs/etc/shadow;
+            echo "Direct shadow write done";
+          }
 
           echo "=== Rootfs size ==="
           sudo du -sh staging/rootfs
@@ -165,10 +174,10 @@ jobs:
           fi
 
           cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << EXTLINUX
-label rk-kernel.dtb linux-${KERNEL_VER}
-	kernel /${KERNEL_IMG}
-	fdt /rk-kernel.dtb
-EXTLINUX
+          label rk-kernel.dtb linux-${KERNEL_VER}
+          \tkernel /${KERNEL_IMG}
+          \tfdt /rk-kernel.dtb
+          EXTLINUX
 
           # Install initrd from rootfs into boot.img
           INITRD_SRC=$(ls staging/rootfs/boot/initrd.img-* 2>/dev/null | head -1)
@@ -176,8 +185,8 @@ EXTLINUX
             INITRD_DST="initrd-${KERNEL_VER}"
             sudo cp "$INITRD_SRC" mnt-boot/${INITRD_DST}
             echo "Initrd installed: ${INITRD_DST}"
-            # 修正后的 sed 指令：确保保持标准的 Tab 缩进且变量正确解析
-            sudo sed -i "/fdt/a\\\tinitrd /${INITRD_DST}" mnt-boot/extlinux/extlinux.conf
+            # append initrd line (actual TAB via printf, no escaping drama)
+            printf '\tinitrd /%s\n' "${INITRD_DST}" | sudo tee -a mnt-boot/extlinux/extlinux.conf > /dev/null
           else
             echo "WARNING: No initrd found in rootfs, boot.img may not boot without external initrd"
           fi
@@ -200,6 +209,16 @@ EXTLINUX
           # Install rootfs
           echo "Installing debootstrap rootfs..."
           sudo cp -a staging/rootfs/* mnt-root/
+
+          # Install kernel modules into rootfs (needed for WiFi/ethernet drivers)
+          if [ -d kernel-staging/lib/modules ]; then
+            MOD_VER=$(ls kernel-staging/lib/modules/ 2>/dev/null | head -1)
+            if [ -n "$MOD_VER" ]; then
+              sudo mkdir -p mnt-root/lib/modules
+              sudo cp -a kernel-staging/lib/modules/$MOD_VER mnt-root/lib/modules/
+              echo "Installed kernel modules: $MOD_VER"
+            fi
+          fi
 
           # Install kernel/dtb to /boot inside rootfs
           sudo mkdir -p mnt-root/boot
