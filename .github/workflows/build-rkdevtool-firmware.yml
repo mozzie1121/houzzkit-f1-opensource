@@ -80,7 +80,7 @@ jobs:
           sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
           sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1
 
-          # 【解决 initrd 缺失的关键点 1】提前将内核模块放入 rootfs，以便 update-initramfs 识别
+          # 提前将编译好的内核模块注入 rootfs，以便 update-initramfs 识别
           if [ -d kernel-staging/lib/modules ]; then
             sudo mkdir -p staging/rootfs/lib/modules
             sudo cp -a kernel-staging/lib/modules/* staging/rootfs/lib/modules/
@@ -103,7 +103,7 @@ jobs:
             systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
             systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
             
-            # 【解决 initrd 缺失的关键点 2】显式为特定内核版本创建 initramfs
+            # 显式为特定内核版本生成 initramfs
             if [ -n \"${KVER}\" ]; then
               update-initramfs -c -k \"${KVER}\"
             else
@@ -120,7 +120,7 @@ jobs:
         run: |
           set -e
 
-          # 清理函数：防止中断时残留挂载与 loop 设备
+          # 清理函数：防止构建异常中断时残留挂载点和 loop 设备
           cleanup() {
             echo "Cleaning up mounts and loop devices..."
             sudo umount mnt-boot 2>/dev/null || true
@@ -176,8 +176,8 @@ EXTLINUX
             INITRD_DST="initrd-${KERNEL_VER}"
             sudo cp "$INITRD_SRC" mnt-boot/${INITRD_DST}
             echo "Initrd installed: ${INITRD_DST}"
-            # Update extlinux.conf with initrd line
-            sudo sed -i '/fdt/a\\tinitrd /'${INITRD_DST}'' mnt-boot/extlinux/extlinux.conf
+            # 修正后的 sed 指令：确保保持标准的 Tab 缩进且变量正确解析
+            sudo sed -i "/fdt/a\\\tinitrd /${INITRD_DST}" mnt-boot/extlinux/extlinux.conf
           else
             echo "WARNING: No initrd found in rootfs, boot.img may not boot without external initrd"
           fi
