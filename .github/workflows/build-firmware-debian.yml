@@ -206,19 +206,20 @@ jobs:
           echo "rootfs.img final: $(ls -lh firmware/rootfs.img | awk '{print $5}')"
 
           # Create parameter.txt matching original factory firmware layout
-          cat > firmware/parameter.txt << PARAM
-FIRMWARE_VER: 1.0.0
-MACHINE_MODEL: HOUZZkit Force 1 (Debian)
-MACHINE_ID: 007
-MANUFACTURER: HOUZZkit
-MAGIC: 0x5041524B
-ATAG: 0x00200800
-MACHINE: 0xffffffff
-CHECK_MASK: 0x80
-PWR_HLD: 0,0,A,0,1
-TYPE: GPT
-CMDLINE:mtdparts=rk29xxnand:0x00004000@0x00004000(uboot),0x00002000@0x00008000(misc),0x00040000@0x0000a000(boot),0x00020000@0x0004a000(recovery),0x00010000@0x0006a000(backup),0xa6ea00@0x0007a000(rootfs),-@0xae8a00(userdata:grow)
-PARAM
+          cp /dev/null firmware/parameter.txt
+          for _kv in \
+            "FIRMWARE_VER: 1.0.0" \
+            "MACHINE_MODEL: HOUZZkit Force 1 (Debian)" \
+            "MACHINE_ID: 007" \
+            "MANUFACTURER: HOUZZkit" \
+            "MAGIC: 0x5041524B" \
+            "ATAG: 0x00200800" \
+            "MACHINE: 0xffffffff" \
+            "CHECK_MASK: 0x80" \
+            "PWR_HLD: 0,0,A,0,1" \
+            "TYPE: GPT" \
+            "CMDLINE:mtdparts=rk29xxnand:0x00004000@0x00004000(uboot),0x00002000@0x00008000(misc),0x00040000@0x0000a000(boot),0x00020000@0x0004a000(recovery),0x00010000@0x0006a000(backup),0xa6ea00@0x0007a000(rootfs),-@0xae8a00(userdata:grow)"; \
+          do echo "$_kv"; done | sudo tee firmware/parameter.txt > /dev/null
 
           echo "=== firmware package contents ==="
           ls -lh firmware/
