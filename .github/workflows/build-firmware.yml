@@ -173,9 +173,10 @@ jobs:
             sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb
           fi
 
-          # Generate fstab matching GPT PARTLABEL scheme
+          # Generate fstab matching original parameter.txt layout
           echo "PARTLABEL=rootfs  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
           echo "PARTLABEL=boot  /boot  ext4  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
+          echo "PARTLABEL=uboot  /bootloader  ext4  defaults,noatime  0  3" | sudo tee -a mnt-root/etc/fstab > /dev/null
 
           sudo sync
           sudo umount mnt-root
@@ -189,19 +190,21 @@ jobs:
           sudo resize2fs -f -M firmware/rootfs.img > /dev/null 2>&1 || true
           echo "rootfs.img final: $(ls -lh firmware/rootfs.img | awk '{print $5}')"
 
-          # Create parameter.txt matching original eMMC GPT layout
+          # Create parameter.txt matching original factory firmware layout
+          # Addresses from original houzzkitos firmware parameter.txt
+          # Unit: 512-byte sectors
           cat > firmware/parameter.txt << PARAM
 FIRMWARE_VER: 1.0.0
 MACHINE_MODEL: HOUZZkit Force 1
 MACHINE_ID: 007
 MANUFACTURER: HOUZZkit
 MAGIC: 0x5041524B
-ATAG: 0x60000000
-MACHINE: 3568
+ATAG: 0x00200800
+MACHINE: 0xffffffff
 CHECK_MASK: 0x80
 PWR_HLD: 0,0,A,0,1
 TYPE: GPT
-CMDLINE:mtdparts=rk29xxnand:0x00004000@0x00000800(uboot),0x00001000@0x00004800(misc),0x00040000@0x00005800(boot),0x00020000@0x00047000(recovery),0x00010000@0x00067000(backup),0x00ACC000@0x00077000(rootfs)
+CMDLINE:mtdparts=rk29xxnand:0x00004000@0x00004000(uboot),0x00002000@0x00008000(misc),0x00040000@0x0000a000(boot:bootable),0x00020000@0x0004a000(recovery),0x00010000@0x0006a000(backup),0xa6ea00@0x0007a000(rootfs),-@0xae8a00(userdata:grow)
 PARAM
 
           echo "=== firmware package contents ==="
