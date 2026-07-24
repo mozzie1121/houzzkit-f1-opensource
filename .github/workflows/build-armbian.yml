@@ -41,13 +41,11 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KCFLAGS="-Wno-error=misleading-indentation"
-
           make distclean
           make jl_v1_linux_defconfig
           make -j$(nproc) Image
           make rockchip/rk3568-jl-rm01.dtb
           make -j$(nproc) modules
-
           mkdir -p ../../kernel-staging/boot ../../kernel-staging/lib/modules
           INSTALL_MOD_PATH=../../kernel-staging make modules_install
           cp arch/arm64/boot/Image ../../kernel-staging/boot/
@@ -64,13 +62,12 @@ jobs:
           make rk3568_defconfig
           make -j$(nproc) 2>&1 || true
           if [ ! -f u-boot.itb ]; then
-            echo "No u-boot.itb, building with dummy tee.bin..."
             touch tee.bin
             make -j$(nproc) u-boot.itb 2>&1 || true
             rm -f tee.bin
           fi
           mkdir -p ../../uboot-output
-          for f in u-boot.itb idbloader.img u-boot.img; do
+          for f in u-boot.itb idbloader.img; do
             [ -f "$f" ] && cp "$f" ../../uboot-output/ && echo "Collected: $f"
           done
           ls -la ../../uboot-output/
@@ -85,10 +82,8 @@ jobs:
           sudo chroot staging/rootfs /bin/bash -c '
             apt-get update
             apt-get install -y --no-install-recommends \
-              systemd systemd-sysv udev \
-              openssh-server sudo curl wget \
-              u-boot-tools network-manager \
-              ca-certificates locales kmod 2>/dev/null || true
+              systemd systemd-sysv udev openssh-server sudo curl wget \
+              u-boot-tools network-manager ca-certificates locales kmod 2>/dev/null || true
             echo "root:1234" | chpasswd
             echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
             locale-gen
@@ -106,13 +101,11 @@ jobs:
           KERNEL_VER="6.1.99"
           DTB="rk3568-jl-rm01.dtb"
 
-          # Create disk image (same layout as original eMMC)
-          # Original: uboot(8MB)+misc(4MB)+boot(128MB ext4)+recovery(64MB)+backup(32MB)+rootfs(~5.3GB)+userdata(~24GB)
-          # Ours:     uboot(8MB)+misc(4MB)+boot(128MB ext4)+rootfs(~2.5GB)
+          # Create disk image matching original eMMC partition layout
+          # p1=uboot(8M) p2=misc(4M) p3=boot(128M ext4) p4=recovery(64M) p5=backup(32M) p6=rootfs
           DISK_SIZE=2800
           sudo dd if=/dev/zero of=staging/armbian.img bs=1M count=$DISK_SIZE status=progress
 
-          # Create GPT partition table with PARTLABELs matching original
           sudo parted staging/armbian.img mktable gpt
           sudo parted staging/armbian.img mkpart uboot fat32 8MiB 16MiB
           sudo parted staging/armbian.img mkpart misc ext4 16MiB 20MiB
@@ -120,26 +113,28 @@ jobs:
           sudo parted staging/armbian.img mkpart recovery ext4 148MiB 212MiB
           sudo parted staging/armbian.img mkpart backup ext4 212MiB 244MiB
           sudo parted staging/armbian.img mkpart rootfs ext4 244MiB 100%
-          sudo parted staging/armbian.img set 1 boot on
 
           LOOP=$(sudo losetup -fP --show staging/armbian.img)
           echo "Loop device: $LOOP"
 
-          # Format partitions (only boot + rootfs need filesystems)
+          # Format boot and rootfs
           sudo mkfs.ext4 -L boot "${LOOP}p3" > /dev/null 2>&1
           sudo mkfs.ext4 -L rootfs "${LOOP}p6" > /dev/null 2>&1
+
+          # Write uboot to uboot partition (p1) - write idbloader + u-boot.itb as raw
+          echo "Writing uboot to partition 1..."
+          sudo dd if=uboot-output/idbloader.img of=${LOOP}p1 bs=512 conv=notrunc status=progress 2>/dev/null || true
+          sudo dd if=uboot-output/u-boot.itb of=${LOOP}p1 bs=512 seek=2048 conv=notrunc status=progress 2>/dev/null || true
 
           mkdir -p mnt-boot mnt-root
           sudo mount "${LOOP}p3" mnt-boot
           sudo mount "${LOOP}p6" mnt-root
 
           # Install rootfs
-          if [ -d staging/rootfs ]; then
-            echo "Installing debootstrap rootfs..."
-            sudo cp -a staging/rootfs/* mnt-root/
-          fi
+          echo "Installing debootstrap rootfs..."
+          sudo cp -a staging/rootfs/* mnt-root/
 
-          # Create /boot in rootfs
+          # Create dirs
           sudo mkdir -p mnt-root/boot mnt-root/etc
 
           # Install kernel modules
@@ -152,24 +147,20 @@ jobs:
             fi
           fi
 
-          # Install kernel Image + dtb to boot partition (matching original naming)
+          # Install kernel to boot partition
           KERNEL_IMG="Image-${KERNEL_VER}"
           if [ -f kernel-staging/boot/Image ]; then
             sudo cp kernel-staging/boot/Image mnt-boot/${KERNEL_IMG}
             sudo cp kernel-staging/boot/${DTB} mnt-boot/
             sudo ln -sf ${DTB} mnt-boot/rk-kernel.dtb
-            echo "Kernel + dtb installed to boot partition"
-          fi
-
-          # Also copy to rootfs /boot
-          if [ -f kernel-staging/boot/Image ]; then
-            sudo mkdir -p mnt-root/boot
+            # Also copy to rootfs /boot
             sudo cp kernel-staging/boot/Image mnt-root/boot/${KERNEL_IMG}
             sudo cp kernel-staging/boot/${DTB} mnt-root/boot/
             sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb 2>/dev/null || true
+            echo "Kernel + dtb installed"
           fi
 
-          # Create extlinux config (matching original format exactly)
+          # Create extlinux config (matching original format)
           sudo mkdir -p mnt-boot/extlinux
           cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << EXTLINUX
           label rk-kernel.dtb linux-${KERNEL_VER}
@@ -177,24 +168,13 @@ jobs:
           \tfdt /rk-kernel.dtb
           EXTLINUX
 
-          # Generate fstab
+          # Generate fstab matching original PARTLABEL scheme
           echo "PARTLABEL=rootfs  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
           echo "PARTLABEL=boot  /boot  ext4  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
 
           sudo sync
-
-          # Clean up mounts
           sudo umount mnt-boot mnt-root
           sudo losetup -d "$LOOP"
-
-          # Write uboot to raw disk offsets (same as original: sector 64 and 16384)
-          echo "Writing u-boot to raw image..."
-          if [ -f uboot-output/idbloader.img ]; then
-            sudo dd if=uboot-output/idbloader.img of=staging/armbian.img bs=512 seek=64 conv=notrunc status=progress
-          fi
-          if [ -f uboot-output/u-boot.itb ]; then
-            sudo dd if=uboot-output/u-boot.itb of=staging/armbian.img bs=512 seek=16384 conv=notrunc status=progress
-          fi
 
           sudo cp staging/armbian.img final-output/houzzkit-f1-armbian.img
           echo "=== Final image ==="
