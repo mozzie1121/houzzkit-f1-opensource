@@ -199,13 +199,13 @@ jobs:
           # Write uboot to raw disk offsets (Rockchip boot flow)
           echo "Writing u-boot to raw image..."
           if [ -f uboot-output/idbloader.img ]; then
-            dd if=uboot-output/idbloader.img of=staging/armbian.img bs=512 seek=64 conv=notrunc status=progress
+            sudo dd if=uboot-output/idbloader.img of=staging/armbian.img bs=512 seek=64 conv=notrunc status=progress
           fi
           if [ -f uboot-output/u-boot.itb ]; then
-            dd if=uboot-output/u-boot.itb of=staging/armbian.img bs=512 seek=16384 conv=notrunc status=progress
+            sudo dd if=uboot-output/u-boot.itb of=staging/armbian.img bs=512 seek=16384 conv=notrunc status=progress
           fi
 
-          cp staging/armbian.img final-output/houzzkit-f1-armbian.img
+          sudo cp staging/armbian.img final-output/houzzkit-f1-armbian.img
           echo "=== Final image ==="
           ls -lh final-output/
 
