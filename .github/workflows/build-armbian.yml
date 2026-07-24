@@ -47,7 +47,8 @@ jobs:
           make -j$(nproc) Image
           make rockchip/rk3568-jl-rm01.dtb
           make -j$(nproc) modules
-          make -j$(nproc) dtbs
+          # make dtbs disabled: bsp lacks some dtb source files
+          # make -j$(nproc) dtbs
 
           mkdir -p ../../kernel-staging/boot ../../kernel-staging/lib/modules
           INSTALL_MOD_PATH=../../kernel-staging make modules_install
