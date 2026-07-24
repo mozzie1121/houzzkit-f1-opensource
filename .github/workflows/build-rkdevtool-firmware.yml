@@ -1,9 +1,13 @@
-name: Build RKDevTool firmware for HOUZZkit Force 1 (RK3568)
+name: Build firmware (Debian Bookworm)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ debian ]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -47,160 +51,203 @@ jobs:
           cp arch/arm64/boot/Image ../../kernel-staging/boot/
           cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../../kernel-staging/boot/
           echo "Kernel built:"
+          ls -la ../../kernel-staging/boot/
 
-      - name: Build rootfs with debootstrap
+      - name: Build U-Boot
+        working-directory: houzzkit-f1-bsp-k6199/u-boot
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make distclean
+          make rk3568_defconfig
+          make -j$(nproc) 2>&1 || true
+          if [ ! -f u-boot.itb ]; then
+            touch tee.bin
+            make -j$(nproc) u-boot.itb 2>&1 || true
+            rm -f tee.bin
+          fi
+          mkdir -p ../../uboot-staging
+          for f in u-boot.itb idbloader.img; do
+            [ -f "$f" ] && cp "$f" ../../uboot-staging/ && echo "Collected: $f"
+          done
+          ls -la ../../uboot-staging/
+
+      - name: Build rootfs with debootstrap (Debian Bookworm)
         run: |
           sudo mkdir -p staging/rootfs
+          echo "=== Creating minimal Debian Bookworm (12) rootfs ==="
           sudo debootstrap --arch=arm64 --foreign bookworm staging/rootfs 2>&1
           sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
-          sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1 || true
-          sudo chroot staging/rootfs /bin/bash -c '
+          sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1
+
+          # 【解决 initrd 缺失的关键点 1】提前将内核模块放入 rootfs，以便 update-initramfs 识别
+          if [ -d kernel-staging/lib/modules ]; then
+            sudo mkdir -p staging/rootfs/lib/modules
+            sudo cp -a kernel-staging/lib/modules/* staging/rootfs/lib/modules/
+          fi
+
+          # 获取实际构建的内核版本号
+          KVER=$(ls kernel-staging/lib/modules/ 2>/dev/null | head -1)
+          echo "Target Kernel Version for initramfs: ${KVER}"
+
+          sudo chroot staging/rootfs /bin/bash -c "
             apt-get update
             apt-get install -y --no-install-recommends \
               systemd systemd-sysv udev openssh-server sudo curl wget \
-              u-boot-tools network-manager ca-certificates locales kmod 2>/dev/null || true
-            echo "root:1234" | chpasswd
-            echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+              u-boot-tools network-manager ca-certificates locales kmod \
+              initramfs-tools firmware-linux \
+              ethtool wireless-regdb
+            echo 'root:houzzkit' | chpasswd
+            echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
             locale-gen
             systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
-          ' || true
+            systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
+            
+            # 【解决 initrd 缺失的关键点 2】显式为特定内核版本创建 initramfs
+            if [ -n \"${KVER}\" ]; then
+              update-initramfs -c -k \"${KVER}\"
+            else
+              update-initramfs -c -k all
+            fi
+          "
 
-      - name: Create boot.img (ext4 with kernel + dtb + extlinux)
+          echo "=== Rootfs size ==="
+          sudo du -sh staging/rootfs
+          echo "=== Initrd files ==="
+          ls -la staging/rootfs/boot/
+
+      - name: Assemble firmware package (RKDevTool format)
         run: |
+          set -e
+
+          # 清理函数：防止中断时残留挂载与 loop 设备
+          cleanup() {
+            echo "Cleaning up mounts and loop devices..."
+            sudo umount mnt-boot 2>/dev/null || true
+            sudo umount mnt-root 2>/dev/null || true
+            [ -n "$LOOP_BOOT" ] && sudo losetup -d "$LOOP_BOOT" 2>/dev/null || true
+            [ -n "$LOOP_ROOT" ] && sudo losetup -d "$LOOP_ROOT" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p firmware
+
           KERNEL_VER="6.1.99"
           DTB="rk3568-jl-rm01.dtb"
 
-          # Create 128MB ext4 boot image
-          sudo dd if=/dev/zero of=boot.img bs=1M count=128 status=progress
-          LOOP=$(sudo losetup -fP --show boot.img)
-          sudo mkfs.ext4 -L boot "${LOOP}"
+          # Create uboot.img — complete Rockchip bootloader
+          if [ -f uboot-staging/idbloader.img ] && [ -f uboot-staging/u-boot.itb ]; then
+            echo "Creating uboot.img from idbloader + u-boot.itb..."
+            sudo dd if=/dev/zero of=firmware/uboot.img bs=1M count=8 status=none
+            sudo dd if=uboot-staging/idbloader.img of=firmware/uboot.img bs=512 conv=notrunc status=none
+            sudo dd if=uboot-staging/u-boot.itb of=firmware/uboot.img bs=512 seek=16384 conv=notrunc status=none
+          else
+            echo "WARNING: uboot build incomplete, creating placeholder uboot.img"
+            sudo dd if=/dev/zero of=firmware/uboot.img bs=1M count=8 status=none
+          fi
+
+          # Create boot.img — ext4 partition with kernel + dtb + extlinux
+          echo "Creating boot.img..."
+          BOOT_SIZE=128
+          sudo dd if=/dev/zero of=firmware/boot.img bs=1M count=$BOOT_SIZE status=none
+          LOOP_BOOT=$(sudo losetup -fP --show firmware/boot.img)
+          sudo mkfs.ext4 -L boot -F "${LOOP_BOOT}" > /dev/null 2>&1
           mkdir -p mnt-boot
-          sudo mount "${LOOP}" mnt-boot
-
-          # Install kernel
+          sudo mount "${LOOP_BOOT}" mnt-boot
           sudo mkdir -p mnt-boot/extlinux
-          KERNEL_IMG="Image-${KERNEL_VER}"
-          sudo cp kernel-staging/boot/Image mnt-boot/${KERNEL_IMG}
-          sudo cp kernel-staging/boot/${DTB} mnt-boot/
-          sudo ln -sf ${DTB} mnt-boot/rk-kernel.dtb
 
-          # extlinux config
+          KERNEL_IMG="Image-${KERNEL_VER}"
+          if [ -f kernel-staging/boot/Image ]; then
+            sudo cp kernel-staging/boot/Image mnt-boot/${KERNEL_IMG}
+            sudo cp kernel-staging/boot/${DTB} mnt-boot/
+            sudo ln -sf ${DTB} mnt-boot/rk-kernel.dtb
+            echo "Kernel + dtb installed to boot.img"
+          fi
+
           cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << EXTLINUX
-          label rk-kernel.dtb linux-${KERNEL_VER}
-          \tkernel /${KERNEL_IMG}
-          \tfdt /rk-kernel.dtb
-          EXTLINUX
+label rk-kernel.dtb linux-${KERNEL_VER}
+	kernel /${KERNEL_IMG}
+	fdt /rk-kernel.dtb
+EXTLINUX
+
+          # Install initrd from rootfs into boot.img
+          INITRD_SRC=$(ls staging/rootfs/boot/initrd.img-* 2>/dev/null | head -1)
+          if [ -n "$INITRD_SRC" ]; then
+            INITRD_DST="initrd-${KERNEL_VER}"
+            sudo cp "$INITRD_SRC" mnt-boot/${INITRD_DST}
+            echo "Initrd installed: ${INITRD_DST}"
+            # Update extlinux.conf with initrd line
+            sudo sed -i '/fdt/a\\tinitrd /'${INITRD_DST}'' mnt-boot/extlinux/extlinux.conf
+          else
+            echo "WARNING: No initrd found in rootfs, boot.img may not boot without external initrd"
+          fi
 
           sudo sync
           sudo umount mnt-boot
-          sudo losetup -d "${LOOP}"
-          e2fsck -f boot.img 2>/dev/null || true
-          echo "boot.img created: $(ls -lh boot.img)"
+          sudo losetup -d "$LOOP_BOOT"
+          LOOP_BOOT=""
+          echo "boot.img done: $(ls -lh firmware/boot.img | awk '{print $5}')"
 
-      - name: Create rootfs.img (ext4 with Debian rootfs)
-        run: |
-          # Create rootfs image - 2500MB
-          sudo dd if=/dev/zero of=rootfs.img bs=1M count=2500 status=progress
-          LOOP=$(sudo losetup -fP --show rootfs.img)
-          sudo mkfs.ext4 -L rootfs "${LOOP}"
+          # Create rootfs.img — ext4 partition with full root filesystem
+          echo "Creating rootfs.img..."
+          ROOTFS_SIZE=2800
+          sudo dd if=/dev/zero of=firmware/rootfs.img bs=1M count=$ROOTFS_SIZE status=none
+          LOOP_ROOT=$(sudo losetup -fP --show firmware/rootfs.img)
+          sudo mkfs.ext4 -L rootfs -F "${LOOP_ROOT}" > /dev/null 2>&1
           mkdir -p mnt-root
-          sudo mount "${LOOP}" mnt-root
+          sudo mount "${LOOP_ROOT}" mnt-root
 
           # Install rootfs
+          echo "Installing debootstrap rootfs..."
           sudo cp -a staging/rootfs/* mnt-root/
 
-          # Install kernel modules
-          if [ -d kernel-staging/lib/modules ]; then
-            MOD_VER=$(ls kernel-staging/lib/modules/ 2>/dev/null | head -1)
-            if [ -n "$MOD_VER" ]; then
-              sudo mkdir -p mnt-root/lib/modules
-              sudo cp -a kernel-staging/lib/modules/$MOD_VER mnt-root/lib/modules/
-            fi
+          # Install kernel/dtb to /boot inside rootfs
+          sudo mkdir -p mnt-root/boot
+          if [ -f kernel-staging/boot/Image ]; then
+            sudo cp kernel-staging/boot/Image mnt-root/boot/${KERNEL_IMG}
+            sudo cp kernel-staging/boot/${DTB} mnt-root/boot/
+            sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb
           fi
 
-          # Copy kernel + dtb to rootfs /boot
-          KERNEL_VER="6.1.99"
-          DTB="rk3568-jl-rm01.dtb"
-          KERNEL_IMG="Image-${KERNEL_VER}"
-          sudo mkdir -p mnt-root/boot
-          sudo cp kernel-staging/boot/Image mnt-root/boot/${KERNEL_IMG}
-          sudo cp kernel-staging/boot/${DTB} mnt-root/boot/
-          sudo ln -sf ${DTB} mnt-root/boot/rk-kernel.dtb 2>/dev/null || true
-
-          # fstab
+          # Generate fstab matching original parameter.txt layout
           echo "PARTLABEL=rootfs  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
           echo "PARTLABEL=boot  /boot  ext4  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
+          echo "PARTLABEL=uboot  /bootloader  ext4  defaults,noatime  0  3" | sudo tee -a mnt-root/etc/fstab > /dev/null
 
           sudo sync
           sudo umount mnt-root
-          sudo losetup -d "${LOOP}"
-          e2fsck -f rootfs.img 2>/dev/null || true
-          echo "rootfs.img created: $(ls -lh rootfs.img)"
+          sudo losetup -d "$LOOP_ROOT"
+          LOOP_ROOT=""
 
-      - name: Create parameter.txt
-        run: |
-          # Matches original eMMC layout exactly
-          # p1=uboot(8M@8M) p2=misc(4M) p3=boot(128M) p4=recovery(64M) p5=backup(32M) p6=rootfs p7=userdata
-          cat > parameter.txt << 'PARAM'
-          FIRMWARE_VER: 1.0.0
-          MACHINE_MODEL: HOUZZkit F1
-          MACHINE_ID: 007
-          MANUFACTURER: HOUZZkit
-          MAGIC: 0x5041524B
-          ATAG: 0x00200800
-          MACHINE: 0xffffffff
-          CHECK_MASK: 0x80
-          PWR_HLD: 0,0,A,0,1
-          TYPE: GPT
-          CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00002000(uboot),0x00001000@0x00004000(misc),0x00020000@0x00005000(boot),0x00010000@0x00025000(recovery),0x00008000@0x00035000(backup),0x00A00000@0x0003D000(rootfs),-@0x00A3D000(userdata:grow)
-          uuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9
-          PARAM
-          echo "parameter.txt:"
-          cat parameter.txt
+          # Trim rootfs image to actual used size
+          echo "Trimming rootfs.img..."
+          sudo e2fsck -fy firmware/rootfs.img > /dev/null 2>&1 || true
+          sudo resize2fs -f -M firmware/rootfs.img > /dev/null 2>&1 || true
+          echo "rootfs.img final: $(ls -lh firmware/rootfs.img | awk '{print $5}')"
 
-      - name: Create flash.bat (Windows batch script)
-        run: |
-          cat > flash.bat << 'BAT'
-          @echo off
-          echo ========================================
-          echo HOUZZkit F1 Flashing Script
-          echo ========================================
-          echo.
-          echo Make sure your device is in Loader mode
-          echo.
-          echo Steps:
-          echo 1. Open RKDevTool
-          echo 2. Load parameter.txt
-          echo 3. Load and flash images in order:
-          echo    - bootloader: uboot.img @ 0x00004000
-          echo    - boot: boot.img @ 0x00008000
-          echo    - rootfs: rootfs.img @ 0x0003D000
-          echo.
-          pause
-          BAT
+          # Create parameter.txt matching original factory firmware layout
+          cp /dev/null firmware/parameter.txt
+          for _kv in \
+            "FIRMWARE_VER: 1.0.0" \
+            "MACHINE_MODEL: HOUZZkit Force 1 (Debian)" \
+            "MACHINE_ID: 007" \
+            "MANUFACTURER: HOUZZkit" \
+            "MAGIC: 0x5041524B" \
+            "ATAG: 0x00200800" \
+            "MACHINE: 0xffffffff" \
+            "CHECK_MASK: 0x80" \
+            "PWR_HLD: 0,0,A,0,1" \
+            "TYPE: GPT" \
+            "CMDLINE:mtdparts=rk29xxnand:0x00004000@0x00004000(uboot),0x00002000@0x00008000(misc),0x00040000@0x0000a000(boot),0x00020000@0x0004a000(recovery),0x00010000@0x0006a000(backup),0xa6ea00@0x0007a000(rootfs),-@0xae8a00(userdata:grow)"; \
+          do echo "$_kv"; done | sudo tee firmware/parameter.txt > /dev/null
 
-      - name: Create package
-        run: |
-          mkdir -p firmware-package
-          cp parameter.txt firmware-package/
-          cp boot.img firmware-package/
-          cp rootfs.img firmware-package/
-          cp flash.bat firmware-package/
-          # Note: uboot.img is NOT included - user must place their original uboot.img in this folder
-          echo "Put your uboot.img (from manufacturer) in this folder" > firmware-package/README.txt
-          echo "Then use RKDevTool or AndroidTool to flash" >> firmware-package/README.txt
-          echo "" >> firmware-package/README.txt
-          echo "Flash order:" >> firmware-package/README.txt
-          echo "1. Bootloader: uboot.img @ 0x00004000" >> firmware-package/README.txt
-          echo "2. boot: boot.img @ 0x00008000" >> firmware-package/README.txt
-          echo "3. rootfs: rootfs.img @ 0x0003D000" >> firmware-package/README.txt
-          echo "" >> firmware-package/README.txt
-          echo "Parameter file: parameter.txt (load into RKDevTool first)" >> firmware-package/README.txt
-          ls -lh firmware-package/
+          echo "=== firmware package contents ==="
+          ls -lh firmware/
 
-      - name: Upload firmware package
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: houzzkit-f1-rkdevtool-firmware
-          path: firmware-package/
+          name: houzzkit-f1-firmware-debian
+          path: firmware/
           retention-days: 7
+          if-no-files-found: warn
