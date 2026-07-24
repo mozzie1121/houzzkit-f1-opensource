@@ -106,7 +106,7 @@ jobs:
 
           # Create disk image
           DISK_SIZE=2800
-          dd if=/dev/zero of=staging/armbian.img bs=1M count=$DISK_SIZE status=progress
+          sudo dd if=/dev/zero of=staging/armbian.img bs=1M count=$DISK_SIZE status=progress
 
           # Partition: GPT with boot (256MB fat32) + rootfs
           sudo parted staging/armbian.img mktable gpt
