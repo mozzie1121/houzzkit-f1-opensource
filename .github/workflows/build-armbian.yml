@@ -32,7 +32,7 @@ jobs:
             u-boot-tools swig python3-distutils \
             python3-dev python3-setuptools \
             cpio rsync bc dosfstools mtools \
-            xz-utils pigz fdisk e2fsprogs
+            xz-utils pigz fdisk e2fsprogs debootstrap
           sudo pip3 install pyelftools -q
 
       - name: Build kernel (Image + dtb + modules)
@@ -47,32 +47,25 @@ jobs:
           make -j$(nproc) Image
           make rockchip/rk3568-jl-rm01.dtb
           make -j$(nproc) modules
-          # make dtbs disabled: bsp lacks some dtb source files
-          # make -j$(nproc) dtbs
 
           mkdir -p ../../kernel-staging/boot ../../kernel-staging/lib/modules
           INSTALL_MOD_PATH=../../kernel-staging make modules_install
           cp arch/arm64/boot/Image ../../kernel-staging/boot/
           cp arch/arm64/boot/dts/rockchip/rk3568-jl-rm01.dtb ../../kernel-staging/boot/
-          # Copy all rockchip dtbs for compatibility
-          mkdir -p ../../kernel-staging/boot/dtb/rockchip
           cp arch/arm64/boot/dts/rockchip/*.dtb ../../kernel-staging/boot/dtb/rockchip/ 2>/dev/null || true
           echo "Kernel built:"
           ls -la ../../kernel-staging/boot/
 
       - name: Build U-Boot
         working-directory: houzzkit-f1-bsp-k6199/u-boot
-        # Note: tee.bin missing in CI env, but make still succeeds with the right target
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           make distclean
           make rk3568_defconfig
-          # Build full u-boot including SPL - tee.bin is optional for Rockchip platforms
           make -j$(nproc) 2>&1 || true
-          # If u-boot.itb failed due to missing tee.bin, we still get idbloader.img + u-boot.img
           if [ ! -f u-boot.itb ]; then
-            echo "No u-boot.itb (missing tee.bin), building uboot.img instead..."
+            echo "No u-boot.itb (missing tee.bin), building with dummy tee.bin..."
             touch tee.bin
             make -j$(nproc) u-boot.itb 2>&1 || true
             rm -f tee.bin
@@ -83,160 +76,62 @@ jobs:
           done
           ls -la ../../uboot-output/
 
-      - name: Clone Armbian build system
+      - name: Build rootfs with debootstrap
         run: |
-          git clone --depth 1 https://github.com/armbian/build.git armbian-build
-          ls -la armbian-build/
-
-      - name: Build Armbian rootfs only (skip kernel)
-        working-directory: armbian-build
-        run: |
-          # Create userpatches/boards directory for our board config
-          mkdir -p userpatches/boards userpatches/kernel
-
-          # Write board config for HOUZZkit F1
-          cat > userpatches/boards/houzzkit-f1.csc << 'BOARD'
-          # HOUZZkit Force 1 (RK3568)
-          BOARD_NAME="HOUZZkit Force 1"
-          BOARDFAMILY="rk3568"
-          BOOTCONFIG="rk3568_defconfig"
-          OVERLAY_PREFIX="rockchip"
-          LINUXFAMILY="rk3568"
-          LINUXCONFIG="linux-rockchip-rk3568"
-          KERNEL_TARGET="current,edge"
-          BOOT_FDT_FILE="rockchip/rk3568-jl-rm01.dtb"
-          BOARD
-          
-          # Build rootfs only (KERNEL_ONLY=no means build full image including rootfs)
-          # SKIP_KERNEL_CHECK=yes to use our kernel
-          # KERNEL_ONLY=yes means only build rootfs without kernel
-          # Actually KERNEL_ONLY=no means build full image (includes kernel from armbian repo)
-          # We want KERNEL_ONLY=yes to just get rootfs, then we inject our kernel
-          
-          sudo ./compile.sh \
-            BOARD=houzzkit-f1 \
-            BRANCH=current \
-            RELEASE=bookworm \
-            BUILD_MINIMAL=yes \
-            BUILD_DESKTOP=no \
-            KERNEL_ONLY=yes \
-            KERNEL_CONFIGURE=no \
-            SKIP_KERNEL_CHECK=yes \
-            EXPERT=yes \
-            PROGRESS_DISPLAY=plain 2>&1 || true
-
-          echo "=== Build output ==="
-          find output -name "*.img" -o -name "*.tar" -o -name "*.tar.xz" -o -name "*.rootfs" 2>/dev/null | head -10
-          ls -lh output/ 2>/dev/null || echo "No output dir"
-          ls -lh .tmp/ 2>/dev/null || true
-
-      - name: Check build output
-        run: |
-          echo "=== ArmBuild output ==="
-          find armbian-build -name "*.img*" -type f 2>/dev/null | head -10
-          find armbian-build -name "*.rootfs*" -type f 2>/dev/null | head -10
-          find armbian-build/output -type f 2>/dev/null | head -20 || true
-          find armbian-build/.tmp -type f 2>/dev/null | head -20 || true
+          sudo mkdir -p staging/rootfs
+          echo "=== Creating minimal Debian Bookworm rootfs ==="
+          sudo debootstrap --arch=arm64 --foreign bookworm staging/rootfs 2>&1
+          sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
+          sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage 2>&1 || true
+          sudo chroot staging/rootfs /bin/bash -c '
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              systemd systemd-sysv udev \
+              openssh-server sudo curl wget \
+              u-boot-tools network-manager \
+              ca-certificates locales kmod 2>/dev/null || true
+            echo "root:1234" | chpasswd
+            echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+            locale-gen
+            systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
+            systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
+          ' || true
+          echo "=== Rootfs size ==="
+          sudo du -sh staging/rootfs
 
       - name: Assemble final image
         run: |
           set -e
           mkdir -p final-output staging
 
-          # Find the rootfs cache or built rootfs
-          ROOTFS_ARCHIVE=$(find armbian-build -maxdepth 5 -name "*.tar*" -path "*/rootfs*" 2>/dev/null | head -1)
-          if [ -z "$ROOTFS_ARCHIVE" ]; then
-            ROOTFS_ARCHIVE=$(find armbian-build -maxdepth 5 -name "*.tar*" 2>/dev/null | head -1)
-          fi
-          
-          if [ -z "$ROOTFS_ARCHIVE" ]; then
-            # Look for cached rootfs
-            ROOTFS_ARCHIVE=$(find armbian-build -maxdepth 5 -name "Armbian_*" -o -name "*.rootfs*" 2>/dev/null | head -1)
-          fi
-
-          echo "Rootfs archive: $ROOTFS_ARCHIVE"
-
-          if [ -z "$ROOTFS_ARCHIVE" ]; then
-            echo "No rootfs found from armbian build, creating minimal rootfs"
-            
-            # Create a minimal Debian rootfs with debootstrap
-            sudo apt-get install -y -qq debootstrap qemu-user-static
-            sudo mkdir -p staging/rootfs
-
-            # Use debootstrap to create a minimal Bookworm rootfs
-            sudo debootstrap --arch=arm64 --foreign bookworm staging/rootfs
-            
-            # Copy qemu user static binary
-            sudo cp /usr/bin/qemu-aarch64-static staging/rootfs/usr/bin/
-            
-            # Complete the bootstrap in chroot
-            sudo chroot staging/rootfs /debootstrap/debootstrap --second-stage
-            
-            # Basic setup
-            sudo chroot staging/rootfs /bin/bash -c '
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                systemd systemd-sysv udev \
-                openssh-server sudo curl wget \
-                u-boot-tools f2fs-tools \
-                network-manager \
-                ca-certificates locales \
-                kmod iptables nftables \
-                armbian-config 2>/dev/null || true
-              
-              # Set root password
-              echo "root:1234" | chpasswd
-              
-              # Generate locales
-              echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-              locale-gen
-              
-              # Enable serial console
-              systemctl enable serial-getty@ttyFIQ0.service 2>/dev/null || true
-              systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
-            ' || true
-          else
-            echo "Using pre-built rootfs: $ROOTFS_ARCHIVE"
-            ROOTFS_FILE="$ROOTFS_ARCHIVE"
-          fi
-
           # Create disk image
-          DISK_SIZE=2800  # MB
+          DISK_SIZE=2800
           dd if=/dev/zero of=staging/armbian.img bs=1M count=$DISK_SIZE status=progress
 
-          # Partition: GPT with boot (256MB fat32) + rootfs (remaining ext4)
+          # Partition: GPT with boot (256MB fat32) + rootfs
           sudo parted staging/armbian.img mktable gpt
           sudo parted staging/armbian.img mkpart primary fat32 8MiB 264MiB
           sudo parted staging/armbian.img mkpart primary ext4 264MiB 100%
           sudo parted staging/armbian.img set 1 boot on
 
-          # Setup loop device
           LOOP=$(sudo losetup -fP --show staging/armbian.img)
-
-          # Format partitions
           sudo mkfs.vfat -F32 -n BOOT "${LOOP}p1"
           sudo mkfs.ext4 -L rootfs "${LOOP}p2"
 
-          # Mount
           mkdir -p mnt-boot mnt-root
           sudo mount "${LOOP}p1" mnt-boot
           sudo mount "${LOOP}p2" mnt-root
 
-          # Install rootfs
+          # Install rootfs from staging
           if [ -d staging/rootfs ]; then
             echo "Installing debootstrap rootfs..."
             sudo cp -a staging/rootfs/* mnt-root/
-          elif [ -f "$ROOTFS_FILE" ]; then
-            echo "Extracting rootfs archive..."
-            case "$ROOTFS_FILE" in
-              *.tar.xz) sudo tar -xJf "$ROOTFS_FILE" -C mnt-root/ ;;
-              *.tar.gz)  sudo tar -xzf "$ROOTFS_FILE" -C mnt-root/ ;;
-              *.tar.bz2) sudo tar -xjf "$ROOTFS_FILE" -C mnt-root/ ;;
-              *.tar)     sudo tar -xf "$ROOTFS_FILE" -C mnt-root/ ;;
-            esac
           fi
 
-          # Install our kernel modules
+          # Create /boot and /etc directories if missing
+          sudo mkdir -p mnt-root/boot mnt-root/etc
+
+          # Install kernel modules
           if [ -d kernel-staging/lib/modules ]; then
             MOD_VER=$(ls kernel-staging/lib/modules/ 2>/dev/null | head -1)
             if [ -n "$MOD_VER" ]; then
@@ -246,17 +141,16 @@ jobs:
             fi
           fi
 
-          # Install kernel Image + dtb
+          # Install kernel Image + dtb to rootfs /boot
           if [ -f kernel-staging/boot/Image ]; then
             sudo mkdir -p mnt-root/boot/dtb/rockchip
             sudo cp kernel-staging/boot/Image mnt-root/boot/vmlinuz-6.1.0-houzzkit
             sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-root/boot/
             sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-root/boot/dtb/rockchip/
-            echo "Kernel Image + dtb installed"
+            echo "Kernel Image + dtb installed to rootfs"
           fi
 
-          # Setup boot partition files
-          # Copy kernel + dtb to boot partition too
+          # Copy kernel and dtb to boot partition
           if [ -f kernel-staging/boot/Image ]; then
             sudo cp kernel-staging/boot/Image mnt-boot/Image
             sudo cp kernel-staging/boot/rk3568-jl-rm01.dtb mnt-boot/
@@ -270,7 +164,7 @@ jobs:
             sudo cp uboot-output/u-boot.itb mnt-boot/
           fi
 
-          # Create extlinux config
+          # Create extlinux config on boot partition
           sudo mkdir -p mnt-boot/extlinux
           cat | sudo tee mnt-boot/extlinux/extlinux.conf > /dev/null << 'EXTLINUX'
           LABEL Armbian
@@ -279,7 +173,7 @@ jobs:
           APPEND root=/dev/mmcblk0p2 rw rootwait console=ttyFIQ0,1500000 console=tty0 earlycon=uart8250,mmio32,0xfe660000 net.ifnames=0 biosdevname=0
           EXTLINUX
 
-          # Create armbianEnv.txt as backup
+          # Create armbianEnv.txt
           cat | sudo tee mnt-boot/armbianEnv.txt > /dev/null << 'ENV'
           verbosity=1
           bootlogo=false
@@ -289,25 +183,20 @@ jobs:
           rootfstype=ext4
           ENV
 
-          # Also copy armbianEnv.txt to /boot
+          # Copy armbianEnv.txt to rootfs /boot
           sudo cp mnt-boot/armbianEnv.txt mnt-root/boot/ 2>/dev/null || true
 
           # Generate fstab
-          echo "/dev/mmcblk0p2  /  ext4  defaults,noatime  0  1" | sudo tee -a mnt-root/etc/fstab > /dev/null
+          echo "/dev/mmcblk0p2  /  ext4  defaults,noatime  0  1" | sudo tee mnt-root/etc/fstab > /dev/null
           echo "/dev/mmcblk0p1  /boot  vfat  defaults,noatime  0  2" | sudo tee -a mnt-root/etc/fstab > /dev/null
 
-          # Fix rootfs boot directory - create symlinks
-          sudo ln -sf /boot/dtb mnt-root/dtb 2>/dev/null || true
-
           sudo sync
-          
+
           # Clean up mounts
           sudo umount mnt-boot mnt-root
           sudo losetup -d "$LOOP"
 
           # Write uboot to raw disk offsets (Rockchip boot flow)
-          # idbloader.img goes to sector 64 (32KB offset)
-          # u-boot.itb goes to sector 16384 (8MB offset)
           echo "Writing u-boot to raw image..."
           if [ -f uboot-output/idbloader.img ]; then
             dd if=uboot-output/idbloader.img of=staging/armbian.img bs=512 seek=64 conv=notrunc status=progress
@@ -316,7 +205,6 @@ jobs:
             dd if=uboot-output/u-boot.itb of=staging/armbian.img bs=512 seek=16384 conv=notrunc status=progress
           fi
 
-          # Compress and copy to final-output
           cp staging/armbian.img final-output/houzzkit-f1-armbian.img
           echo "=== Final image ==="
           ls -lh final-output/
