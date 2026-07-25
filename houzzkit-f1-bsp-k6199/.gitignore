@@ -88,4 +88,4 @@ kernel-6.1/vmlinux.symvers
 kernel-6.1/arch/arm64/boot/Image.lz4
 kernel-6.1/arch/arm64/kernel/vdso/vdso.so
 kernel-6.1/arch/arm64/kernel/vdso/vdso.so.dbg
-kernel-6.1/extboot/extlinux/extlinux.conf
+kernel-6.1/extboot/extlinux/extlinux.conf*.dts.pre

@@ -272,17 +272,29 @@
 
 &rknpu {
 	rknpu-supply = <&vdd_npu>;
-	status = "okay";
+	status = "disabled";
 };
 
 &rknpu_mmu {
-	status = "okay";
+	status = "disabled";
+};
+
+/ {
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0xfe660000 console=ttyFIQ0 root=/dev/mmcblk1p2 rootfstype=ext4 rw rootwait clk_ignore_unused coherent_pool=1m systemd.gpt_auto=0 cgroup_enable=memory swapaccount=1 swiotlb=0x10000 net.ifnames=0";
+	};
+};
+
+&power {
+	power-domain@6 {
+		status = "disabled";
+	};
 };
 
 &bus_npu {
 	bus-supply = <&vdd_logic>;
 	pvtm-supply = <&vdd_cpu>;
-	status = "okay";
+	status = "disabled";
 };
 
 &vdpu {
@@ -328,7 +340,7 @@
 	non-removable;
 	max-frequency = <200000000>;
 	full-pwr-cycle-in-suspend;
-	status = "okay";
+	status = "disabled";
 };
 
 /*for sd*/
