@@ -20,7 +20,14 @@
 #define CONFIG_SYS_MMC_ENV_DEV		0
 
 #undef CONFIG_BOOTCOMMAND
-#define CONFIG_BOOTCOMMAND RKIMG_BOOTCOMMAND
+/*
+ * Skip Android boot flow (boot_android/boot_fit/bootrkp) which sets
+ * hardcoded bootargs (root=PARTLABEL=rootfs pointing to eMMC).
+ * Go straight to distro boot so extlinux.conf APPEND is sole source.
+ */
+#define CONFIG_BOOTCOMMAND \
+	"setenv bootargs; " \
+	"run distro_bootcmd;"
 
 #ifdef CONFIG_USB_FUNCTION_DFU
 #define CONFIG_SET_DFU_ALT_INFO
