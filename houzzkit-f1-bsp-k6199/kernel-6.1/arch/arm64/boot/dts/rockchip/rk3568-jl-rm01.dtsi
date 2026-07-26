@@ -272,11 +272,11 @@
 
 &rknpu {
 	rknpu-supply = <&vdd_npu>;
-	status = "disabled";
+	status = "okay";
 };
 
 &rknpu_mmu {
-	status = "disabled";
+	status = "okay";
 };
 
 / {
@@ -287,14 +287,14 @@
 
 &power {
 	power-domain@6 {
-		status = "disabled";
+		status = "okay";
 	};
 };
 
 &bus_npu {
 	bus-supply = <&vdd_logic>;
 	pvtm-supply = <&vdd_cpu>;
-	status = "disabled";
+	status = "okay";
 };
 
 &vdpu {
