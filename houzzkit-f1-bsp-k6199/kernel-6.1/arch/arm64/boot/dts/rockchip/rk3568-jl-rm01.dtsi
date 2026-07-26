@@ -281,7 +281,7 @@
 
 / {
 	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0xfe660000 console=ttyFIQ0 root=/dev/mmcblk1p2 rootfstype=ext4 rw rootwait clk_ignore_unused coherent_pool=1m systemd.gpt_auto=0 cgroup_enable=memory swapaccount=1 swiotlb=0x10000 net.ifnames=0";
+		bootargs = "";
 	};
 };
 
